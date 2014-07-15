@@ -433,6 +433,7 @@ class _WaterfallImageRenderer(QtCore.QObject):
         #get the precise memory location we want to start the buffer from...
         pixel_offset = self.__cur_buffer_row * raw_w
         byte_offset = 4 * pixel_offset
+        byte_offset = 0
         ptr = ctypes.c_char.from_buffer(self.__ring_buffer, byte_offset)
         #construct the display image from the memory at this pointer...
         fmt = QtGui.QImage.Format.Format_ARGB32
@@ -475,6 +476,7 @@ class _WaterfallImageRenderer(QtCore.QObject):
             # - FIXME
             populated_row_filter = img_data[:, 0] != np.NINF
             populated_img_data = img_data[populated_row_filter, :]
+            populated_row_count = populated_img_data.shape[0]
             
             self._src_data = collections.deque(populated_img_data)
             
@@ -489,7 +491,7 @@ class _WaterfallImageRenderer(QtCore.QObject):
             # our current frame pointer offset...
             self.__ring_buffer = np.vstack((tmp_img.data, tmp_img.data))
             dlog("ring buffer size set to %r" % (self.__ring_buffer.shape, ))
-            self.__cur_buffer_row = self._raw_image_height
+            self.__cur_buffer_row = self._raw_image_height - populated_row_count
             
             #set our _qimage to point at the proper location in the ring buffer...
             self._point_raw_image_at_cur_offset()
@@ -523,10 +525,10 @@ class _WaterfallImageRenderer(QtCore.QObject):
             
             self.__cur_buffer_row -= 1
             if self.__cur_buffer_row < 0:
-                self.__cur_buffer_row = img_rows
+                self.__cur_buffer_row = img_rows - 1
             
             idx1 = self.__cur_buffer_row
-            idx2 = self.__cur_buffer_row + img_rows - 1
+            idx2 = self.__cur_buffer_row + img_rows
             
             #update the local copy of source data...
             self._src_data.append(row_data)
@@ -546,7 +548,9 @@ class _WaterfallImageRenderer(QtCore.QObject):
         self._point_raw_image_at_cur_offset()
         
         et2 = time.time() - st
+        #self._image_ready = False
         pass #as a breakpoint anchor
+    
     
     
     def _process_rendering_pipeline(self):
@@ -585,7 +589,11 @@ class _WaterfallImageRenderer(QtCore.QObject):
 
     def _get_data_from_model(self, num_rows):
         #This is thread-safe because get_latest_data is.
-        return self._data_model.get_latest_data(num_rows, True)
+        model_data = self._data_model.get_latest_data(num_rows, True)
+        if model_data is None:
+            return None
+        else:
+            return model_data[::-1]
 
     ### PUBLIC METHODS
     ### PUBLIC METHODS
@@ -1046,7 +1054,7 @@ class WaterfallPlotWidget(QtGui.QWidget):
     def _onGradientChange(self, gradient_editor_item):
         assert isinstance(gradient_editor_item, pg.GradientEditorItem)
         lut = gradient_editor_item.getLookupTable(self._LUT_PTS)
-        self._renderer.setLookupTable(lut)
+        self.set_lut(lut)
     
     def _onNewDataRow(self, data_row_tuple):
         timestamp_s, data_row, metadata = data_row_tuple
