@@ -1,23 +1,24 @@
+import sys
 import collections
 import threading
 import time
 import itertools
 import ctypes
 import Queue
+import logging
 
-# import required libraries
-from pyqtgraph.Qt import QtGui, QtCore
+from PySide import QtGui, QtCore
 import pyqtgraph as pg
 import pyqtgraph.functions as pgfuncs
-import sys
 import numpy as np
-
 
 FRAME_WAIT_TIMEOUT_s = 0.2
 CROSSHAIR_FPS = 10.0
 
-DLOG_ENABLED = True and __debug__
+# workaround for pyqtgraph trying to compile external lib at runtime
+pg.setConfigOption('useWeave', False)
 
+DLOG_ENABLED = False
 DLOG_start_time = None
 def dlog(msg):
     """Simple debug logging function."""
@@ -121,7 +122,10 @@ class WaterfallModel(QtCore.QObject):
                 ret = np.ndarray((0, num_data_cols))
         else:
             #make the 2D array with vstack...
-            all_data = np.vstack(data_arrays)
+            if data_arrays:
+                all_data = np.vstack(data_arrays)
+            else:
+                all_data = np.ndarray((0, self._x_len))
             if pad_black and (num_rows > len(data_arrays)):
                 #make just enough 'black' rows to pad to the provided number
                 #of rows...
@@ -271,7 +275,7 @@ class _WaterfallImageRenderer(QtCore.QObject):
         self._fps_timer.start(self._frame_period_ms)
 
 
-    def start(self):
+    def start_thread(self):
         """Kicks off the rendering thread that actually does all the work."""
         self._render_thread_name = "WFRenderer-%d" % self._instance_count
         self._instance_count += 1
@@ -299,6 +303,9 @@ class _WaterfallImageRenderer(QtCore.QObject):
         
         new_size_tuple = new_size.toTuple()
         old_size_tuple = old_size.toTuple()
+        
+        if min(new_size_tuple) <= 0:
+            return
         
         if old_size_tuple == (-1, -1):
             #This is our first indication of what size the image widget we
@@ -398,25 +405,34 @@ class _WaterfallImageRenderer(QtCore.QObject):
                 #dlog("FRAME OK!")
                 break
     
-    
+    def rebuild_output_image(self):
+        """
+        Process all pending items in the rendering pipeline and signal
+        new generated output image if one is available.
+        """
+        self._process_rendering_pipeline()
+
+        if self._raw_image is None:
+            return
+
+        output_image = self._raw_image.scaled(self._output_image_width,
+                                              self._output_image_height)
+        self.sigNewImageReady.emit(output_image)
+
     def _thread_master(self):
         """The master function that is run on the rendering thread."""
         # This IS the rendering thread.
         while self._active:
-            self._process_rendering_pipeline()
-            
+            self.rebuild_output_image()
+
             if self._raw_image is None:
                 continue
-            
-            output_image = self._raw_image.scaled(self._output_image_width,
-                                                  self._output_image_height)
-            
+
             #emit signals...
             # - note that the sigImageRendered emit statement will block due
             #    to the way we connected it.  This is intentional and is a
             #    cheap way for us to do nothing on this thread until the main
             #    Qt event loop has rendered the image.
-            self.sigNewImageReady.emit(output_image)
             self.sigImageRendered.emit() #blocking emit
             self._wait_for_frame_ok()
     
@@ -607,6 +623,13 @@ class _WaterfallImageRenderer(QtCore.QObject):
                 dlog("setLookupTable triggered a full image refresh!")
                 self._do_full_image_refresh()
     
+    def set_lookup_levels(self, color_lookup_min, color_lookup_max):
+        new_levels = (color_lookup_min, color_lookup_max)
+        dlog("set_lookup_levels(%s, %s) called" % new_levels)
+        if new_levels != self._lut_levels:
+            self._lut_levels = new_levels
+            self._do_full_image_refresh()
+    
     def add_image_row(self, data_row):
         assert data_row.ndim == 1
         #Note that the data queue handles both new rows and full data sets.
@@ -683,6 +706,8 @@ class _WaterfallImageRenderer(QtCore.QObject):
         """Cleanly changes the data model the renderer uses."""
         #This call is thread safe.
         assert isinstance(data_model, WaterfallModel)
+        if not self._raw_image_height:
+            return
         def _reset_data_model():
             self._data_model = data_model
             self._raw_image_width = self._data_model._x_len
@@ -877,7 +902,8 @@ class WaterfallPlotWidget(QtGui.QWidget):
                 msg = ("If scale_limits is specified, it must be a tuple like "
                        "(black_level, white_level)")
                 raise ValueError(msg)
-            self._scale_limits = scale_limits
+        
+        self._scale_limits = scale_limits
         self._show_ge = show_gradient_editor
         self._vertical_stretch = vertical_stretch
         self._data_model = data_model
@@ -900,7 +926,8 @@ class WaterfallPlotWidget(QtGui.QWidget):
         
         if self._show_ge:
             self._gradient_editor = pg.GradientWidget(parent = self,
-                                                      orientation = "right")
+                                                      orientation = "left")
+            self._gradient_editor.loadPreset('thermal')
         
         #configure the widgets...
         #self._plot_widget.addItem(self._wf_img)
@@ -909,9 +936,9 @@ class WaterfallPlotWidget(QtGui.QWidget):
         #do layout...
         hbox = QtGui.QHBoxLayout(self)
         #hbox.addWidget(self._plot_widget)
-        hbox.addWidget(self._wf_img)
         if self._show_ge:
             hbox.addWidget(self._gradient_editor)
+        hbox.addWidget(self._wf_img)
         
         #Configure the background image renderer (but don't start it yet)...
         self._renderer = _WaterfallImageRenderer(data_model,
@@ -930,16 +957,7 @@ class WaterfallPlotWidget(QtGui.QWidget):
         """
         #dlog("onImageRendered fired!")
         pass
-    
-    
-    def paintEvent(self, event):
-        #we will only ever run this once and then pass back to the
-        #superclass event handler. Now is a safe time to start the rendering
-        #thread...
-        dlog("Starting rendering thread...")
-        self._renderer.start()
-        self.paintEvent = super(WaterfallPlotWidget, self).paintEvent
-        self.paintEvent(event)
+
     
     def _toggle_model_slots(self, enable):
         if enable:
@@ -1087,11 +1105,27 @@ class WaterfallPlotWidget(QtGui.QWidget):
         #assuming no model changes happen during us (could lock to prevent this).
         
         #Also note that we don't want to move set_new_data_model to *after*
-        #the slot reconnection since new data dimensions may not natch old
+        #the slot reconnection since new data dimensions may not match old
         #ones, and this would mess the renderer up.
         self._data_model = data_model
         self._toggle_model_slots(True)
         
         #HACK (to avoid lost row potential)...
         #self._renderer.set_new_data_model(data_model)
+    
+    def set_lookup_levels(self, color_lookup_min, color_lookup_max):
+        self._renderer.set_lookup_levels(color_lookup_min, color_lookup_max)
 
+
+class ThreadedWaterfallPlotWidget(WaterfallPlotWidget):
+    """
+    Automatically start renderer thread on first paintEvent
+    """
+    def paintEvent(self, event):
+        #we will only ever run this once and then pass back to the
+        #superclass event handler. Now is a safe time to start the rendering
+        #thread...
+        dlog("Starting rendering thread...")
+        self._renderer.start_thread()
+        self.paintEvent = super(WaterfallPlotWidget, self).paintEvent
+        self.paintEvent(event)
