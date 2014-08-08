@@ -214,7 +214,6 @@ class _WaterfallImageRenderer(QtCore.QObject):
         assert isinstance(data_model, WaterfallModel)
         
         self._active = True
-        self._raw_image = None
         self._render_thread_name = None
         
         #We will keep a local copy of the data that is currently being
@@ -230,8 +229,6 @@ class _WaterfallImageRenderer(QtCore.QObject):
         self.__ring_buffer = None
         self.__cur_buffer_row = None
         
-        self._raw_image_height  = None
-        self._raw_image_width = None
         self._output_image_width = None
         self._output_image_height = None
         
@@ -304,7 +301,7 @@ class _WaterfallImageRenderer(QtCore.QObject):
         new_size_tuple = new_size.toTuple()
         old_size_tuple = old_size.toTuple()
         
-        if min(new_size_tuple) <= 0:
+        if min(new_size_tuple) <= 0: #happens during some init sequencing
             return
         
         if old_size_tuple == (-1, -1):
@@ -312,14 +309,11 @@ class _WaterfallImageRenderer(QtCore.QObject):
             #will be rendering to is.
             self._output_image_width = new_size_tuple[0]
             self._output_image_height = new_size_tuple[1]
-            self._raw_image_height = self._output_image_height
-            #self._raw_image_width comes from the data model... but it might
-            #not have any data yet! This has to be populated later.
         
         if new_size_tuple != old_size_tuple: #we have a real resize event
             new_width, new_height = new_size_tuple
             old_width, old_height = old_size_tuple
-            refresh_image_data = (new_height != old_height)
+            refresh_image_data = True
             
             #updating image params while the render thread may be rendering
             #is a Bad idea, so we'll serialize it in the render pipeline...
@@ -327,25 +321,19 @@ class _WaterfallImageRenderer(QtCore.QObject):
                 dlog("resize_image() closure called")
                 self._output_image_width = new_width
                 self._output_image_height = new_height
-                self._raw_image_height = new_height
                 #self._raw_image_width is the width of the current data model
                 #(if it *has* data).
                 
-                if refresh_image_data:
-                    # Keep it simple for now and just re-fetch all the
-                    # appropriate data and redraw. This could be smarter.
-                    # Note that both calls are thread safe.
-                    new_data = self._get_data_from_model(new_height)
-                    if new_data is None:
-                        self._draw_no_data_image()
-                    else:
-                        self._create_image(new_data)
+                # Keep it simple for now and just re-fetch all the
+                # appropriate data and redraw. This could be smarter.
+                # Note that both calls are thread safe.
+                new_data = self._get_data_from_model(new_height)
+                if new_data is None:
+                    self._draw_no_data_image()
+                else:
+                    self._create_image(new_data)
             
             #queue up the resize in the render pipeline...
-            #if refresh_image_data:
-                ##anything else in the pipeline is pointless
-                #with self._render_pipeline.mutex:
-                    #self._render_pipeline.queue.clear()
             self._render_pipeline.put(resize_image)
     
     
@@ -412,11 +400,10 @@ class _WaterfallImageRenderer(QtCore.QObject):
         """
         self._process_rendering_pipeline()
 
-        if self._raw_image is None:
+        if self._output_image is None:
             return
 
-        output_image = self._raw_image.scaled(self._output_image_width,
-                                              self._output_image_height)
+        output_image = self._output_image.copy()
         self.sigNewImageReady.emit(output_image)
 
     def _thread_master(self):
@@ -425,7 +412,7 @@ class _WaterfallImageRenderer(QtCore.QObject):
         while self._active:
             self.rebuild_output_image()
 
-            if self._raw_image is None:
+            if self._output_image is None:
                 continue
 
             #emit signals...
@@ -437,23 +424,23 @@ class _WaterfallImageRenderer(QtCore.QObject):
             self._wait_for_frame_ok()
     
     
-    def _point_raw_image_at_cur_offset(self):
+    def _point_output_image_at_cur_offset(self):
         """Sets the address of the _qimage data to the current/correct
         circular buffer location.
         
         """
         assert threading.current_thread().name == self._render_thread_name
         
-        raw_w = self._raw_image_width
-        raw_h = self._raw_image_height
+        w = self._output_image_width
+        h = self._output_image_height
         #get the precise memory location we want to start the buffer from...
-        pixel_offset = self.__cur_buffer_row * raw_w
+        pixel_offset = self.__cur_buffer_row * w
         byte_offset = 4 * pixel_offset
         byte_offset = 0
         ptr = ctypes.c_char.from_buffer(self.__ring_buffer, byte_offset)
         #construct the display image from the memory at this pointer...
         fmt = QtGui.QImage.Format.Format_ARGB32
-        self._raw_image = QtGui.QImage(ptr, raw_w, raw_h, fmt)
+        self._output_image = QtGui.QImage(ptr, w, h, fmt)
     
     
     def _draw_no_data_image(self):
@@ -467,36 +454,75 @@ class _WaterfallImageRenderer(QtCore.QObject):
                                            lut=self._lut,
                                            levels=self._lut_levels,
                                            )
-            self._raw_image = pgfuncs.makeQImage(argb, alpha, transpose=False)
+            img = pgfuncs.makeQImage(argb, alpha, transpose=False)
+            self._output_image = img.scaled(self._output_image_width,
+                                            self._output_image_height)
+            
         self._render_pipeline.put(_draw_ndi)
     
     
-    def _create_image(self, img_data):
+    def _create_image(self, src_data):
         """This is the new image handler in the render pipeline.
         
-        Regenerates a completely new image, given the new img_data.
+        Regenerates a completely new image, given the new src_data.
         
         """
         assert threading.current_thread().name == self._render_thread_name
-        assert img_data.ndim == 2
+        assert src_data.ndim == 2
+        assert src.data.shape[0] <= self._output_image_height
         
-        dlog("_create_image called and re-assigning raw image dimensions")
+        dlog("_create_image called with brand new src_data")
         with self._mutex:
-            #self._raw_image_height is dictated by the widget height, but the
-            #raw img width comes from the underlying data model...
-            self._raw_image_width = img_data.shape[1]
+            #figure out how to squish/bin the data range into the available pixels...
+            # - bin_indices can be worked out in advance (when the image size changes, or when the waterfall model width changes)
+            x_data = np.linspace(0, self._output_image_width - 1, num_src_cols)
+            bin_defs = numpy.arange(1, self._output_image_width + 1) #satrting at one since digitzie is like a histogram and < the first bin is 0.
+            bin_indices = np.digitize(x_data, bins) #this can be worked out when src_data changes, or when the image changes
+            
+            if self._binning_method == "max":
+                bin_vals = [src_data[bin_indices == i].max() for i in xrange(len(bin_defs))]
+            elif self._binning_method == "mean":
+                bin_vals = [src_data[bin_indices == i].mean() for i in xrange(len(bin_defs))]
+            elif self._binning_method == "min":
+                bin_vals = [src_data[bin_indices == i].min() for i in xrange(len(bin_defs))]
+            
+            #We now have the source data processed into pixel bins the way we
+            #want it. It is ready for conversion to a waterfall image.
+            #  - previously we wer econverting the whole row and relying on
+            #     image stretching to make it look good... but image compression
+            #     was not properly managing data... eg: single tones were being hidden
+            #     by the compression.  We mostly want the max of a bin.
+            
+            fix me here this is where I got to!!!
+            fix me here this is where I got to!!!
+            fix me here this is where I got to!!!
+            fix me here this is where I got to!!!
+            
+            digitized = numpy.digitize(data, bins)
+            bin_means = [data[digitized == i].mean() for i in range(1, len(bins))]
+            
+            
+            
+            num_src_rows, num_src_cols = src_data.shape
+            
+            pad_count = (num_src_cols % self._output_image_width)
+            padding = np.empty()
+            num_cols = src_data.shape[1]
+            
+            
+            a.reshape((10, 2, 5)).max(axis=2)
             
             #only keep a record of those rows that have data...
             # - soemthing is backwards here... we should be able to have the
             #    real data instead of going backwards from img data.
             # - FIXME
-            populated_row_filter = img_data[:, 0] != np.NINF
-            populated_img_data = img_data[populated_row_filter, :]
+            populated_row_filter = src_data[:, 0] != np.NINF
+            populated_img_data = src_data[populated_row_filter, :]
             populated_row_count = populated_img_data.shape[0]
             
             self._src_data = collections.deque(populated_img_data)
             
-            argb, alpha = pgfuncs.makeARGB(img_data,
+            argb, alpha = pgfuncs.makeARGB(src_data,
                                            lut=self._lut,
                                            levels=self._lut_levels,
                                            )
@@ -507,10 +533,10 @@ class _WaterfallImageRenderer(QtCore.QObject):
             # our current frame pointer offset...
             self.__ring_buffer = np.vstack((tmp_img.data, tmp_img.data))
             dlog("ring buffer size set to %r" % (self.__ring_buffer.shape, ))
-            self.__cur_buffer_row = self._raw_image_height - populated_row_count
+            self.__cur_buffer_row = self._output_image_height - populated_row_count
             
             #set our _qimage to point at the proper location in the ring buffer...
-            self._point_raw_image_at_cur_offset()
+            self._point_output_image_at_cur_offset()
             
             self._image_ready = True
     
@@ -533,8 +559,8 @@ class _WaterfallImageRenderer(QtCore.QObject):
             assert threading.current_thread().name == self._render_thread_name
             assert row_data.shape == (self._raw_image_width, )
                 
-            img_cols = self._raw_image_width
-            img_rows = self._raw_image_height
+            img_cols = self._output_image_width
+            img_rows = self._output_image_height
             
             lut = self._lut
             lut_levels = self._lut_levels
@@ -561,7 +587,7 @@ class _WaterfallImageRenderer(QtCore.QObject):
         self.__ring_buffer[idx2, :, :] = new_img_row.data
         
         et1 = time.time() - st
-        self._point_raw_image_at_cur_offset()
+        self._point_output_image_at_cur_offset()
         
         et2 = time.time() - st
         #self._image_ready = False
@@ -596,7 +622,7 @@ class _WaterfallImageRenderer(QtCore.QObject):
     def _do_full_image_refresh(self):
         """Triggers a complete redraw with new data."""
         dlog("Full image refresh triggered!")
-        img_data = self._get_data_from_model(self._raw_image_height)
+        img_data = self._get_data_from_model(self._output_image_height)
         if img_data is None:
             self._draw_no_data_image()
         else:
@@ -619,7 +645,7 @@ class _WaterfallImageRenderer(QtCore.QObject):
         dlog("setLookupTable called")
         if not np.array_equal(self._lut, lut):
             self._lut = lut
-            if self._raw_image is not None:
+            if self._output_image is not None:
                 dlog("setLookupTable triggered a full image refresh!")
                 self._do_full_image_refresh()
     
@@ -706,7 +732,7 @@ class _WaterfallImageRenderer(QtCore.QObject):
         """Cleanly changes the data model the renderer uses."""
         #This call is thread safe.
         assert isinstance(data_model, WaterfallModel)
-        if not self._raw_image_height:
+        if not self._output_image_height:
             return
         def _reset_data_model():
             self._data_model = data_model
